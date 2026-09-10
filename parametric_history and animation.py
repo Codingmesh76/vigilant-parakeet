@@ -13,8 +13,8 @@
 
 bl_info = {
     "name": "Parametric History",
-    "author": "Claude",
-    "version": (1, 5, 0),
+    "author": "Claude-Mahesh",
+    "version": (1, 5, 1),
     "blender": (3, 0, 0),
     "location": "View3D > N-Panel > Param History, Add > Mesh",
     "description": (
@@ -45,6 +45,7 @@ from bpy.props import (
     CollectionProperty,
 )
 from bpy.types import Operator, Panel, PropertyGroup, UIList
+from bpy.app.handlers import persistent
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +385,18 @@ def regenerate_mesh(obj, ptype, params):
         bpy.data.meshes.remove(old_mesh)
     new_mesh.update()
 
+    # Record what this rebuild reflects and force a redraw/re-evaluation.
+    # Centralized here so every caller (manual edit, Apply/Cancel/Restore,
+    # Add, and the frame-change handler) stays consistent automatically.
+    try:
+        obj["_ph_last_built"] = json.dumps(params, sort_keys=True)
+    except Exception:
+        pass
+    try:
+        obj.update_tag(refresh={"OBJECT", "DATA"})
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Property groups
@@ -412,18 +425,38 @@ def on_draft_changed(self, context):
         pass
 
 
+@persistent
 def ph_frame_change_handler(scene, *_args):
     """Safety net for keyframe-driven animation: Blender's depsgraph does not
     always re-invoke a custom PropertyGroup field's update() callback when a
     value changes purely because of F-curve/keyframe evaluation (as opposed
     to a direct edit), so on every frame change we explicitly rebuild the
-    mesh for any tracked object whose draft values may have been animated."""
+    mesh for any tracked object whose draft values may have been animated.
+
+    Also force-tags changed objects and redraws open 3D viewports, since
+    reassigning obj.data from inside this handler does not always propagate
+    to the viewport on its own during playback."""
+    changed_any = False
     for obj in bpy.data.objects:
-        if obj.type == "MESH" and getattr(obj, "ph_type", "") and getattr(obj, "ph_live_preview", True):
-            try:
-                regenerate_mesh(obj, obj.ph_type, params_to_dict(obj.ph_draft))
-            except Exception:
-                pass
+        if obj.type != "MESH" or not getattr(obj, "ph_type", "") or not getattr(obj, "ph_live_preview", True):
+            continue
+        try:
+            current = json.dumps(params_to_dict(obj.ph_draft), sort_keys=True)
+            if obj.get("_ph_last_built") == current:
+                continue
+            regenerate_mesh(obj, obj.ph_type, params_to_dict(obj.ph_draft))
+            changed_any = True
+        except Exception as e:
+            print(f"[Parametric History] Frame-change rebuild failed for '{obj.name}': {e}")
+
+    if changed_any:
+        try:
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == "VIEW_3D":
+                        area.tag_redraw()
+        except Exception:
+            pass
 
 
 class PH_ParamsGroup(PropertyGroup):
@@ -582,6 +615,8 @@ class OBJECT_OT_ph_convert_to_mesh(Operator):
         obj = context.object
         name = obj.ph_type.replace("_", " ").title()
         obj.ph_type = ""
+        if "_ph_last_built" in obj:
+            del obj["_ph_last_built"]
         obj.ph_history.clear()
         obj.ph_history_index = 0
         self.report({"INFO"}, f"{name} converted to a standard mesh object")
